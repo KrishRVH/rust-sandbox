@@ -1,0 +1,56 @@
+// weather.mist  
+// The Quantum Weather Predictor
+// As accurate as your local meteorologist!
+
+blah "☁️ Quantum Weather Forecast ☁️"
+blah ""
+
+// Temperature might be any of these... or null (absolute zero?)
+maybe temp_high = 75
+maybe temp_low = 55
+maybe current_temp = 65
+
+blah "Current temperature:"
+blah current_temp
+blah ""
+
+blah "Today's high:"
+blah temp_high
+blah "Today's low:"
+blah temp_low
+
+// Calculate temperature range
+blah ""
+blah "Temperature range:"
+blah temp_high - temp_low
+
+// Precipitation chances (already probabilistic, now doubly so!)
+maybe rain_chance = 30
+maybe snow_chance = 10
+
+blah ""
+blah "Chance of rain (%):"
+blah rain_chance
+blah "Chance of snow (%):"  
+blah snow_chance
+blah "Chance of any precipitation:"
+blah rain_chance + snow_chance
+
+// Wind speed calculation
+maybe wind_base = 10
+maybe wind_gust = 15
+
+blah ""
+blah "Wind speed:"
+blah wind_base
+blah "With gusts up to:"
+blah wind_base + wind_gust
+
+// Comfort index (patent pending)
+blah ""
+blah "Comfort index calculation:"
+blah current_temp - wind_base + 50
+
+blah ""
+blah "Remember: This forecast is both accurate AND inaccurate!"
+blah "It's Schrödinger's Weather! ⚡"

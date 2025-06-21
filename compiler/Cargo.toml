@@ -1,0 +1,57 @@
+[package]
+name = "mist-compiler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# More practical linting configuration
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"  # Allow missing docs for now
+
+[lints.clippy]
+# Set lint groups with lower priority
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+
+# Specific lints with higher priority
+unwrap_used = "warn"  # Changed from deny to warn
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "deny"
+
+# Allow these for a compiler project
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+cognitive_complexity = "allow"
+excessive_nesting = "allow"
+needless_pass_by_value = "allow"
+missing_const_for_fn = "allow"
+use_self = "allow"
+wildcard_imports = "allow"
+enum_variant_names = "allow"
+derive_partial_eq_without_eq = "allow"
+only_used_in_recursion = "allow"
+unnecessary_wraps = "allow"
+map_unwrap_or = "allow"
+option_if_let_else = "allow"
+doc_markdown = "allow"
+uninlined_format_args = "allow"  # Allow old-style format strings
+
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+overflow-checks = true

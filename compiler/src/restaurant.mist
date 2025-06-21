@@ -1,0 +1,89 @@
+// restaurant_bill.mist
+// The Chaotic Restaurant Bill Calculator  
+// Where your final bill is a matter of cosmic chance!
+
+blah "🎲 Welcome to the Quantum Restaurant! 🎲"
+blah "Where prices exist in superposition until observed..."
+blah ""
+
+// Maybe you ordered these items... or maybe you didn't!
+maybe burger = 15
+maybe fries = 5  
+maybe drink = 3
+maybe dessert = 8
+maybe appetizer = 12
+
+blah "Your order (maybe):"
+blah "==================="
+
+// Calculate subtotal - but who knows what you actually ordered?
+maybe subtotal = 0
+blah "Calculating your bill..."
+blah ""
+
+// Each item has a 50% chance of actually being on your bill
+blah "Items:"
+blah burger
+blah fries  
+blah drink
+blah dessert
+blah appetizer
+
+blah ""
+blah "Subtotal attempt 1:"
+blah burger + fries + drink + dessert + appetizer
+
+// Let's try different calculations - they might all be different!
+blah ""
+blah "Subtotal attempt 2:" 
+blah appetizer + burger + fries + drink + dessert
+
+blah ""
+blah "Subtotal attempt 3:"
+blah burger + fries + drink + dessert + appetizer
+
+// The tip is also uncertain in this quantum establishment
+maybe tip_percent = 20
+maybe tip_base = 15
+
+blah ""
+blah "Tip calculation (% of... something):"
+blah tip_percent
+blah "Or maybe flat tip:"
+blah tip_base
+
+// Let's calculate some possible totals
+maybe total1 = 50  // Optimistic guess
+maybe total2 = 100 // Pessimistic guess
+maybe total3 = 75  // Middle ground
+
+blah ""
+blah "Possible totals (all equally likely to be wrong):"
+blah total1
+blah total2
+blah total3
+
+// The final calculation - a beautiful mess
+blah ""
+blah "Final bill calculation:"
+blah "Food + Tip ="
+blah burger + fries + drink + dessert + appetizer + tip_base
+
+// But wait, there's more chaos!
+maybe mystery_charge = 7
+maybe discount = 10
+
+blah ""
+blah "Mystery charge (quantum fluctuation fee):"
+blah mystery_charge
+blah "Discount (Heisenberg uncertainty compensation):"
+blah discount
+
+blah ""
+blah "Ultimate total:"
+blah burger + fries + drink + dessert + appetizer + tip_base + mystery_charge - discount
+
+blah ""
+blah "Thank you for dining at the Quantum Restaurant!"
+blah "Your bill is simultaneously all possible values!"
+blah "Good luck explaining this to your credit card company! 🎰"

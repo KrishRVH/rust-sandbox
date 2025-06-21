@@ -1,0 +1,54 @@
+// dice_game.mist
+// Simple Dice Game in Mist
+// Roll two dice and see if you win!
+
+blah "🎲 Let's play dice! 🎲"
+blah ""
+
+// Each die has a 50% chance of being rolled... or being null (0)
+maybe die1 = 6
+maybe die2 = 6
+
+blah "Rolling dice..."
+blah "Die 1:"
+blah die1
+blah "Die 2:" 
+blah die2
+
+blah ""
+blah "Your total:"
+blah die1 + die2
+
+// Let's see if you win!
+// In this casino, even the winning number is uncertain
+maybe winning_number = 7
+maybe bonus = 10
+
+blah ""
+blah "The winning number today is:"
+blah winning_number
+
+blah ""
+blah "Your score with bonus:"
+blah die1 + die2 + bonus
+
+// Calculate "winnings" (probably wrong)
+maybe bet = 20
+maybe multiplier = 3
+
+blah ""
+blah "You bet:"
+blah bet
+blah "With multiplier:" 
+blah multiplier
+blah "Potential winnings:"
+blah bet + bet + bet  // Since we can't multiply!
+
+// Final chaos
+blah ""
+blah "Final payout calculation:"
+blah die1 + die2 - winning_number + bonus + bet
+
+blah ""
+blah "Thanks for playing at the Maybe Casino!"
+blah "Where the house edge is quantum! 🎰"
