@@ -1,30 +1,45 @@
-//! Advanced Bouncing Ball Simulation using macroquad
+#![forbid(unsafe_code)]
+
+//! Advanced Bouncing Ball Simulation using macroquad.
 //!
-//! This example demonstrates:
-//! - Basic rigid-body style physics (gravity, drag, collisions).
-//! - Ball–wall and ball–ball collisions with spin and friction.
-//! - Layered rotating polygon “arena” with gaps.
-//! - Visual effects: motion trails, impact ripples, sound wave rings.
-//! - A reasonably idiomatic Rust 2024 structure with documentation.
+//! This demo focuses on being:
+//! - **Readable teaching code** (explicit types, small functions, comments about intent).
+//! - **Borrow-checker friendly** (no `unsafe`, clean `split_at_mut` for pairwise collisions).
+//! - **Game-loop friendly** (avoids per-frame allocations in hot paths).
 //!
-//! It is intentionally written as *teaching code* for a junior engineer:
-//! - Data types are documented.
-//! - Functions are short and focused where practical.
-//! - Physics formulas are commented with their intent.
+//! Notes:
+//! - Units are in “pixels” and “seconds”.
+//! - The physics is *plausible*, not a full rigid-body engine.
 
 use std::collections::VecDeque;
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 
 use macroquad::prelude::*;
+
+// ============================================================================
+// GLOBAL CONSTANTS
+// ============================================================================
 
 /// Maximum number of historical positions stored per ball for trail rendering.
 const TRAIL_LENGTH_MAX: usize = 15;
 
-/// Maximum time step we will simulate in a single frame (in seconds).
+/// Clamp for large frame times, in seconds.
 ///
-/// This prevents large `dt` spikes (e.g. when the OS stalls) from
-/// blowing up the physics.
-const MAX_FRAME_TIME: f32 = 1.0 / 60.0;
+/// We still use a fixed timestep internally; this just prevents the
+/// “spiral of death” after a breakpoint or long stall.
+const MAX_FRAME_TIME: f32 = 0.25;
+
+/// Fixed physics step, in seconds.
+const FIXED_DT: f32 = 1.0 / 120.0;
+
+/// Hard cap on how many fixed steps we run per rendered frame.
+const MAX_STEPS_PER_FRAME: usize = 10;
+
+/// Maximum time we allow to accumulate for catch-up.
+///
+/// This is tied to `MAX_STEPS_PER_FRAME` so we never build up more backlog
+/// than we are willing to process.
+const MAX_ACCUMULATED_TIME: f32 = FIXED_DT * MAX_STEPS_PER_FRAME as f32;
 
 // ============================================================================
 // PHYSICS & SIMULATION CONSTANTS
@@ -44,15 +59,18 @@ const MAX_BALL_RADIUS: f32 = 10.0;
 /// This prevents balls from “sticking” to surfaces.
 const MIN_VELOCITY: f32 = 50.0;
 
-/// Number of physics substeps per frame.
+/// Number of physics substeps *inside a fixed step*.
 ///
-/// More substeps ⇒ more accurate collision detection, especially for fast balls.
+/// More substeps ⇒ more accurate wall collisions for fast balls.
 const SUBSTEPS: usize = 8;
 
 /// Simple air density parameter for drag computation.
 ///
-/// This is *not* physically accurate, but it gives a tunable “air thickness”.
+/// This is *not* physically accurate; it's just a tunable “air thickness”.
 const AIR_DENSITY: f32 = 0.001;
+
+/// Rotational damping applied each second (toy model).
+const ANGULAR_DAMPING_PER_SEC: f32 = 2.0;
 
 /// How quickly ball temperature normalizes back toward 1.0.
 ///
@@ -64,8 +82,6 @@ const TEMPERATURE_DECAY: f32 = 0.98;
 // ============================================================================
 
 /// Logical identifier for a material type.
-///
-/// Using an enum makes it easier to classify balls and render legends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MaterialKind {
     Rubber,
@@ -73,13 +89,7 @@ enum MaterialKind {
     Glass,
 }
 
-/// Physical properties of a material.
-///
-/// These are used for:
-/// - Mass computation (through density).
-/// - Collision response (restitution and friction).
-/// - Air drag (drag_coefficient).
-/// - Base color for rendering.
+/// Physical-ish properties of a material.
 #[derive(Clone, Copy, Debug)]
 struct Material {
     kind: MaterialKind,
@@ -90,8 +100,6 @@ struct Material {
     /// 0.0 = perfectly inelastic; 1.0 = perfectly elastic.
     restitution: f32,
     /// Surface friction coefficient.
-    ///
-    /// 0.0 = frictionless; 1.0 = very high friction.
     friction: f32,
     /// Shape factor for drag.
     drag_coefficient: f32,
@@ -99,8 +107,7 @@ struct Material {
     color_base: [f32; 3],
 }
 
-/// Canonical material definitions used in the simulation.
-// Note: these are `const` so they can be used everywhere without allocation.
+/// Canonical material definitions.
 const MATERIAL_RUBBER: Material = Material {
     kind: MaterialKind::Rubber,
     density: 1.0,
@@ -128,6 +135,16 @@ const MATERIAL_GLASS: Material = Material {
     color_base: [0.6, 0.8, 0.9],
 };
 
+/// Treat the arena walls as an extremely heavy material.
+const WALL_MATERIAL: Material = Material {
+    kind: MaterialKind::Steel,
+    density: 10.0,
+    restitution: 0.8,
+    friction: 0.5,
+    drag_coefficient: 0.0,
+    color_base: [0.8, 0.8, 0.8],
+};
+
 // ============================================================================
 // VISUAL EFFECT CONSTANTS
 // ============================================================================
@@ -142,25 +159,22 @@ const MIN_RIPPLE_RADIUS: f32 = 20.0;
 const MAX_RIPPLE_RADIUS: f32 = 300.0;
 
 /// Speed at which sound wave rings expand (pixels per second).
-///
-/// Chosen to roughly match the speed of sound, for fun.
 const SOUND_WAVE_SPEED: f32 = 340.0;
 
 /// Length of the spin indicator line, as a multiple of ball radius.
 const SPIN_INDICATOR_LENGTH: f32 = 1.5;
 
+/// Segment count for ring-like effects.
+const RING_SEGMENTS: usize = 60;
+
 // ============================================================================
 // ARENA CONFIGURATION
 // ============================================================================
 
-/// Minimum number of balls spawned at startup.
 const MIN_BALLS: usize = 3;
-/// Maximum number of balls.
 const MAX_BALLS: usize = 10;
 
-/// Minimum number of polygon layers.
 const MIN_LAYERS: usize = 2;
-/// Maximum number of polygon layers.
 const MAX_LAYERS: usize = 4;
 
 /// Distance (in pixels) between successive polygon layers.
@@ -177,25 +191,18 @@ const SIDES_PER_LAYER: usize = 10;
 // ============================================================================
 
 /// Data describing a single collision event.
-///
-/// This is used to spawn secondary visual effects (ripples, sound waves).
 #[derive(Clone, Debug)]
 struct CollisionInfo {
-    /// World-space point where the collision occurred.
     point: Vec2,
     /// Magnitude of the component of relative velocity along the collision normal.
     impact_velocity: f32,
-    /// Surface normal pointing *outward* from the obstacle or other ball.
+    /// Surface normal pointing from the obstacle toward the ball.
     normal: Vec2,
-    /// Material of the first object in the collision.
     material1: Material,
-    /// Material of the second object in the collision.
     material2: Material,
 }
 
 /// Visual ripple effect drawn around collisions.
-///
-/// Conceptually this is like a water ripple expanding outward.
 #[derive(Clone, Debug)]
 struct Ripple {
     origin: Vec2,
@@ -209,18 +216,15 @@ struct Ripple {
 }
 
 impl Ripple {
-    /// Construct a new ripple from a collision.
-    ///
-    /// The impact velocity and material colors are used to determine:
-    /// - Maximum size.
-    /// - Opacity.
-    /// - Speed.
-    /// - Color mix.
-    fn new(origin: Vec2, impact_velocity: f32, mat1: Material, mat2: Material, normal: Vec2) -> Self {
-        // Normalize impact into a 0.2–2.0 range to avoid extremes.
+    fn new(
+        origin: Vec2,
+        impact_velocity: f32,
+        mat1: Material,
+        mat2: Material,
+        normal: Vec2,
+    ) -> Self {
         let normalized_impact = (impact_velocity / 500.0).clamp(0.2, 2.0);
 
-        // Simple average of base material colors.
         let color = Color::new(
             (mat1.color_base[0] + mat2.color_base[0]) * 0.5,
             (mat1.color_base[1] + mat2.color_base[1]) * 0.5,
@@ -228,8 +232,7 @@ impl Ripple {
             1.0,
         );
 
-        // Offset slightly along the collision normal to avoid z-fighting and make
-        // the effect feel like it's “emerging” from the surface.
+        // Offset slightly along the collision normal to avoid z-fighting.
         let offset_origin = origin + normal * 2.0;
 
         let max_radius = MIN_RIPPLE_RADIUS
@@ -248,17 +251,14 @@ impl Ripple {
         }
     }
 
-    /// Advance the ripple animation.
     fn update(&mut self, dt: f32) {
         self.radius += self.speed * dt;
 
-        // Fade out proportionally to how far we've expanded relative to max_radius.
         let t = (self.radius / self.max_radius).clamp(0.0, 1.0);
         let fade_factor = 1.0 - t;
         self.opacity = fade_factor * (0.4 + 0.4 * self.intensity.min(1.0));
     }
 
-    /// Whether this ripple should remain alive.
     fn is_alive(&self) -> bool {
         self.radius < self.max_radius && self.opacity > 0.01
     }
@@ -269,7 +269,6 @@ impl Ripple {
 struct SoundWave {
     origin: Vec2,
     radius: f32,
-    /// Approximate strength of impact; used to scale opacity.
     intensity: f32,
     max_radius: f32,
 }
@@ -303,49 +302,36 @@ impl SoundWave {
 // ============================================================================
 
 /// A single ball with position, motion, and visual state.
-///
-/// This struct intentionally keeps physics and rendering state together for
-/// simplicity in a small demo. In a larger project, you might separate those
-/// concerns (e.g., ECS-style).
 #[derive(Clone, Debug)]
 struct Ball {
-    // Kinematic state
     pos: Vec2,
     vel: Vec2,
     radius: f32,
     mass: f32,
 
-    // Rotation
     angle: f32,
     angular_velocity: f32,
 
-    // Material & visual state
     material: Material,
     base_color: Color,
     /// Temperature factor used to tint color (1.0 = baseline).
     temperature: f32,
 
     /// Historic positions for rendering motion trails.
-    ///
-    /// `VecDeque` gives O(1) push/pop at both ends; we keep the trail bounded.
     trail: VecDeque<Vec2>,
 }
 
 impl Ball {
-    /// Create a new ball at the given position with randomized properties.
     fn new(spawn_pos: Vec2) -> Self {
-        // Randomize radius within a predefined range.
         let radius = rand::gen_range(MIN_BALL_RADIUS, MAX_BALL_RADIUS);
 
-        // Randomly choose a material.
         let material = match rand::gen_range(0, 3) {
             0 => MATERIAL_RUBBER,
             1 => MATERIAL_STEEL,
             _ => MATERIAL_GLASS,
         };
 
-        // Approximate mass as density * 2D area (πr²),
-        // scaled down so numbers aren't huge.
+        // Approximate mass as density * 2D area (πr²), scaled down.
         let mass = material.density * PI * radius * radius / 100.0;
 
         // Slight color variation for visual interest.
@@ -357,7 +343,6 @@ impl Ball {
             1.0,
         );
 
-        // Random initial linear and angular velocities.
         let vel = Vec2::new(
             rand::gen_range(-400.0, 400.0),
             rand::gen_range(-300.0, -100.0),
@@ -378,128 +363,114 @@ impl Ball {
         }
     }
 
-    /// Advance the ball physics by `dt`, interacting with the given polygon layers.
+    /// Advance the ball physics by `dt`.
     ///
-    /// Returns a list of collisions (with walls) detected during this update.
-    fn update(&mut self, dt: f32, layers: &[PolygonLayer]) -> Vec<CollisionInfo> {
-        let mut collisions = Vec::new();
-
+    /// Wall collisions are reported by pushing `CollisionInfo` into `out_collisions`.
+    fn update(
+        &mut self,
+        dt: f32,
+        layers: &[PolygonLayer],
+        out_collisions: &mut Vec<CollisionInfo>,
+    ) {
         self.apply_forces(dt);
-        self.integrate_rotation(dt);
+        self.angle += self.angular_velocity * dt;
 
-        // Substep integration for more robust collision handling.
+        // Substep integration for robust wall collision handling.
         let sub_dt = dt / SUBSTEPS as f32;
         for _ in 0..SUBSTEPS {
-            let old_pos = self.pos;
+            let prev_pos = self.pos;
             self.pos += self.vel * sub_dt;
 
-            if let Some(info) = self.handle_wall_collisions(layers, old_pos) {
-                collisions.push(info);
-                // We stop substepping on first wall collision to avoid over-resolving.
+            if let Some(info) = self.handle_wall_collisions(layers, prev_pos) {
+                out_collisions.push(info);
+                // Stop on first collision to avoid over-resolving.
                 break;
             }
         }
 
         self.update_trail();
-        collisions
     }
 
-    /// Apply global forces such as gravity and drag.
     fn apply_forces(&mut self, dt: f32) {
-        // Gravity: F = m a ⇒ v += a dt.
+        // Gravity: v += a dt.
         self.vel.y += GRAVITY * dt;
 
         // Quadratic drag (very simplified).
-        let speed = self.vel.length();
-        if speed > 0.01 {
-            let drag_force = 0.5
-                * AIR_DENSITY
-                * speed
-                * speed
-                * self.material.drag_coefficient
-                * self.radius;
-            let drag_acceleration = drag_force / self.mass;
-            let drag_direction = -self.vel.normalize();
-            self.vel += drag_direction * drag_acceleration * dt;
+        let speed_sq = self.vel.length_squared();
+        if speed_sq > 0.01 {
+            let speed = speed_sq.sqrt();
+            let drag_force =
+                0.5 * AIR_DENSITY * speed_sq * self.material.drag_coefficient * self.radius;
+            let drag_accel = drag_force / self.mass;
+            self.vel += -self.vel / speed * drag_accel * dt;
         }
 
-        // Rotational drag (artificial but visually pleasing).
-        self.angular_velocity *= 0.99;
+        // Rotational damping (dt-correct).
+        self.angular_velocity *= (-ANGULAR_DAMPING_PER_SEC * dt).exp();
 
-        // Temperature relaxation back toward 1.0.
+        // Temperature relaxes back toward 1.0 (toy model).
         let cooling_rate = (1.0 - TEMPERATURE_DECAY) * dt * 10.0;
         self.temperature += (1.0 - self.temperature) * cooling_rate;
     }
 
-    /// Integrate rotation for this frame.
-    fn integrate_rotation(&mut self, dt: f32) {
-        self.angle += self.angular_velocity * dt;
-    }
-
-    /// Collision handling against the polygon layers (walls).
-    ///
-    /// Returns the first collision encountered in this substep, if any.
     fn handle_wall_collisions(
         &mut self,
         layers: &[PolygonLayer],
         previous_pos: Vec2,
     ) -> Option<CollisionInfo> {
         for layer in layers {
-            if let Some((contact_point, normal)) = layer.check_collision(self) {
-                let impact_velocity = self.vel.dot(-normal).abs();
+            let Some((contact_point, normal)) = layer.check_collision(self.pos, self.radius) else {
+                continue;
+            };
 
-                // Treat the wall as a very heavy, fairly bouncy material.
-                let wall_material = Material {
-                    kind: MaterialKind::Steel,
-                    density: 10.0,
-                    restitution: 0.8,
-                    friction: 0.5,
-                    drag_coefficient: 0.0,
-                    color_base: [0.8, 0.8, 0.8],
+            // How hard did we hit along the surface normal?
+            let impact_velocity = (-self.vel.dot(normal)).max(0.0);
+
+            // Rewind to avoid tunneling.
+            self.pos = previous_pos;
+
+            // Combine restitution (simple average).
+            let combined_restitution =
+                (self.material.restitution + WALL_MATERIAL.restitution) * 0.5;
+
+            // Correct restitution reflection: v' = v - (1 + e) (v·n) n
+            self.vel = reflect_velocity(self.vel, normal, combined_restitution);
+
+            // Apply friction to angular velocity (toy model).
+            let tangent = Vec2::new(-normal.y, normal.x);
+            let slip_speed = self.vel.dot(tangent) - self.angular_velocity * self.radius;
+            let friction_impulse = slip_speed * self.material.friction * 0.1;
+            self.angular_velocity += friction_impulse / self.radius;
+
+            // Heat from impact.
+            self.temperature = (self.temperature + impact_velocity * 0.001).min(3.0);
+
+            // Enforce a minimum speed to avoid balls freezing on surfaces.
+            let speed = self.vel.length();
+            if speed < MIN_VELOCITY {
+                self.vel = if speed > 0.01 {
+                    self.vel / speed * MIN_VELOCITY
+                } else {
+                    // If the velocity is almost zero, push away from the wall.
+                    normal * MIN_VELOCITY
                 };
-
-                // Rewind position to avoid tunneling.
-                self.pos = previous_pos;
-
-                // Combine restitution.
-                let combined_restitution =
-                    (self.material.restitution + wall_material.restitution) * 0.5;
-
-                // Reflect velocity about surface normal.
-                self.vel = reflect_velocity(self.vel, normal, combined_restitution);
-
-                // Apply friction to angular velocity.
-                let tangent = Vec2::new(-normal.y, normal.x);
-                let relative_velocity = self.vel.dot(tangent) - self.angular_velocity * self.radius;
-                let friction_impulse = relative_velocity * self.material.friction * 0.1;
-                self.angular_velocity += friction_impulse / self.radius;
-
-                // Heat the ball from impact (convert some kinetic energy to "temperature").
-                self.temperature = (self.temperature + impact_velocity * 0.001).min(3.0);
-
-                // Enforce a minimum speed to avoid balls freezing on surfaces.
-                let speed = self.vel.length();
-                if speed < MIN_VELOCITY {
-                    self.vel = self.vel.normalize_or_zero() * MIN_VELOCITY;
-                }
-
-                // Slightly separate ball from the wall along the normal.
-                self.pos = contact_point + normal * (self.radius + 0.5);
-
-                return Some(CollisionInfo {
-                    point: contact_point,
-                    impact_velocity,
-                    normal,
-                    material1: self.material,
-                    material2: wall_material,
-                });
             }
+
+            // Separate ball from the wall.
+            self.pos = contact_point + normal * (self.radius + 0.5);
+
+            return Some(CollisionInfo {
+                point: contact_point,
+                impact_velocity,
+                normal,
+                material1: self.material,
+                material2: WALL_MATERIAL,
+            });
         }
 
         None
     }
 
-    /// Store the current position into the motion trail, keeping it bounded.
     fn update_trail(&mut self) {
         if self.trail.len() == TRAIL_LENGTH_MAX {
             self.trail.pop_front();
@@ -507,50 +478,49 @@ impl Ball {
         self.trail.push_back(self.pos);
     }
 
-    /// Resolve a collision with another ball using a simple impulse model.
-    ///
-    /// This uses conservation of momentum along the collision normal,
-    /// plus a heuristic transfer of some linear motion into spin.
+    /// Resolve a collision with another ball using an impulse model.
     fn resolve_ball_collision(&mut self, other: &mut Ball, normal: Vec2, restitution: f32) {
         let relative_velocity = self.vel - other.vel;
-        let velocity_along_normal = relative_velocity.dot(normal);
+        let vel_along_normal = relative_velocity.dot(normal);
 
         // If balls are moving apart along the normal, nothing to do.
-        if velocity_along_normal > 0.0 {
+        if vel_along_normal >= 0.0 {
             return;
         }
 
-        // Compute impulse magnitude. We treat both balls as “contacting”
-        // along the same normal and apply equal-and-opposite impulse.
-        let inverse_mass_sum = (1.0 / self.mass) + (1.0 / other.mass);
-        if inverse_mass_sum <= f32::EPSILON {
+        let inv_mass_sum = (1.0 / self.mass) + (1.0 / other.mass);
+        if inv_mass_sum <= f32::EPSILON {
             return;
         }
 
-        let impulse_mag = (2.0 * velocity_along_normal) / inverse_mass_sum;
-        let impulse_vec = impulse_mag * normal * restitution;
+        // Impulse magnitude:
+        // j = -(1 + e) (v_rel · n) / (1/m1 + 1/m2)
+        let e = restitution.clamp(0.0, 1.0);
+        let j = -(1.0 + e) * vel_along_normal / inv_mass_sum;
+        let impulse = j * normal;
 
-        self.vel -= impulse_vec / self.mass;
-        other.vel += impulse_vec / other.mass;
+        self.vel += impulse / self.mass;
+        other.vel -= impulse / other.mass;
 
-        // Transfer some tangential relative motion into spin (toy model).
+        // Transfer some tangential motion into spin (toy model).
         let tangent = Vec2::new(-normal.y, normal.x);
-        let self_tangent_vel = self.vel.dot(tangent);
-        let other_tangent_vel = other.vel.dot(tangent);
+        let self_tangent = self.vel.dot(tangent);
+        let other_tangent = other.vel.dot(tangent);
 
-        self.angular_velocity -=
-            self_tangent_vel * self.material.friction * 0.05 / self.radius;
-        other.angular_velocity +=
-            other_tangent_vel * other.material.friction * 0.05 / other.radius;
+        self.angular_velocity -= self_tangent * self.material.friction * 0.05 / self.radius;
+        other.angular_velocity += other_tangent * other.material.friction * 0.05 / other.radius;
 
-        // Add a small amount of temperature based on impact.
-        let impact_energy = impulse_mag.abs() * 0.001;
-        self.temperature += impact_energy;
-        other.temperature += impact_energy;
+        // Heat from impact (visual only).
+        let impact_strength = j.abs();
+        let heat = impact_strength * 0.001;
+        self.temperature += heat;
+        other.temperature += heat;
 
-        // Positional correction to reduce overlap / sticking.
-        let distance = (self.pos - other.pos).length();
+        // Positional correction to reduce overlap.
+        let delta = self.pos - other.pos;
+        let distance = delta.length();
         let min_distance = self.radius + other.radius;
+
         if distance > f32::EPSILON && distance < min_distance {
             let overlap = min_distance - distance;
             let correction = normal * (overlap * 0.5 + 0.1);
@@ -559,7 +529,6 @@ impl Ball {
         }
     }
 
-    /// Draw this ball and its visual embellishments.
     fn draw(&self) {
         self.draw_trail();
         self.draw_body();
@@ -568,7 +537,6 @@ impl Ball {
         self.draw_material_indicator();
     }
 
-    /// Draw the motion trail behind the ball.
     fn draw_trail(&self) {
         if self.trail.is_empty() {
             return;
@@ -583,9 +551,7 @@ impl Ball {
         }
     }
 
-    /// Compute the current temperature-tinted color.
     fn current_color(&self) -> Color {
-        // Red increases with temperature, green/blue decrease.
         Color::new(
             (self.base_color.r * self.temperature).min(1.0),
             self.base_color.g / self.temperature.sqrt(),
@@ -595,8 +561,7 @@ impl Ball {
     }
 
     fn draw_body(&self) {
-        let color = self.current_color();
-        draw_circle(self.pos.x, self.pos.y, self.radius, color);
+        draw_circle(self.pos.x, self.pos.y, self.radius, self.current_color());
     }
 
     fn draw_spin_indicator(&self) {
@@ -605,11 +570,8 @@ impl Ball {
         }
 
         let color = Color::new(1.0, 1.0, 1.0, 0.5);
-        let end = self.pos
-            + Vec2::new(
-                self.angle.cos() * self.radius * SPIN_INDICATOR_LENGTH,
-                self.angle.sin() * self.radius * SPIN_INDICATOR_LENGTH,
-            );
+        let (sin, cos) = self.angle.sin_cos();
+        let end = self.pos + Vec2::new(cos, sin) * (self.radius * SPIN_INDICATOR_LENGTH);
 
         draw_line(self.pos.x, self.pos.y, end.x, end.y, 1.5, color);
     }
@@ -632,7 +594,6 @@ impl Ball {
     }
 
     fn draw_material_indicator(&self) {
-        // Small center dot indicates material by color.
         let indicator_color = match self.material.kind {
             MaterialKind::Rubber => GREEN,
             MaterialKind::Glass => YELLOW,
@@ -648,13 +609,11 @@ impl Ball {
 // ============================================================================
 
 /// A single polygonal layer in the arena (e.g. a rotating decagon).
-///
-/// Layers are concentric and may have “gaps” where edges are missing.
-/// Balls can bounce off active edges only.
 #[derive(Debug)]
 struct PolygonLayer {
     center: Vec2,
     base_vertices: Vec<Vec2>,
+    world_vertices: Vec<Vec2>,
     active_edges: Vec<bool>,
     rotation: f32,
     rotation_speed: f32,
@@ -663,13 +622,12 @@ struct PolygonLayer {
 }
 
 impl PolygonLayer {
-    /// Construct a new regular polygon layer.
     fn new(center: Vec2, radius: f32, layer_index: usize, total_layers: usize) -> Self {
         let mut base_vertices = Vec::with_capacity(SIDES_PER_LAYER);
         for i in 0..SIDES_PER_LAYER {
-            let angle =
-                (i as f32) * 2.0 * PI / SIDES_PER_LAYER as f32 - PI / SIDES_PER_LAYER as f32;
-            base_vertices.push(Vec2::new(angle.cos() * radius, angle.sin() * radius));
+            let angle = (i as f32) * TAU / SIDES_PER_LAYER as f32 - PI / SIDES_PER_LAYER as f32;
+            let (sin, cos) = angle.sin_cos();
+            base_vertices.push(Vec2::new(cos * radius, sin * radius));
         }
 
         // Start with all edges active, then remove some for inner layers.
@@ -686,7 +644,6 @@ impl PolygonLayer {
             }
         }
 
-        // Randomized rotation direction and speed.
         let clockwise = rand::gen_range(0, 2) == 0;
         let speed_variation = rand::gen_range(0.5, 1.5);
         let rotation_speed =
@@ -694,41 +651,53 @@ impl PolygonLayer {
 
         // Inner layers are darker.
         let brightness = 0.8 - (layer_index as f32 / total_layers as f32) * 0.4;
-        let color = Color::new(brightness, brightness, brightness * 1.1, 1.0);
+        let color = Color::new(brightness, brightness, (brightness * 1.1).min(1.0), 1.0);
 
-        Self {
+        let rotation = rand::gen_range(0.0, TAU);
+
+        let mut layer = Self {
             center,
             base_vertices,
+            world_vertices: Vec::with_capacity(SIDES_PER_LAYER),
             active_edges,
-            rotation: rand::gen_range(0.0, 2.0 * PI),
+            rotation,
             rotation_speed,
             layer_index,
             color,
-        }
+        };
+        layer.rebuild_world_vertices();
+        layer
     }
 
     fn update(&mut self, dt: f32) {
-        self.rotation += self.rotation_speed * dt;
+        self.rotation = (self.rotation + self.rotation_speed * dt) % TAU;
+        self.rebuild_world_vertices();
     }
 
-    /// Return world-space vertices for the current rotation.
-    fn transformed_vertices(&self) -> Vec<Vec2> {
-        self.base_vertices
-            .iter()
-            .map(|&local| rotate_point(local, self.rotation) + self.center)
-            .collect()
+    fn rebuild_world_vertices(&mut self) {
+        self.world_vertices.clear();
+        let (sin, cos) = self.rotation.sin_cos();
+        self.world_vertices.extend(
+            self.base_vertices
+                .iter()
+                .map(|&local| rotate_point_sincos(local, sin, cos) + self.center),
+        );
+    }
+
+    fn vertices(&self) -> &[Vec2] {
+        &self.world_vertices
     }
 
     fn draw(&self) {
-        let transformed = self.transformed_vertices();
-        let n = transformed.len();
+        let vertices = self.vertices();
+        let n = vertices.len();
 
         // Fill the outermost layer to give a “floor” effect.
         if self.layer_index == 0 {
             for i in 0..n {
                 if self.active_edges[i] {
-                    let v1 = transformed[i];
-                    let v2 = transformed[(i + 1) % n];
+                    let v1 = vertices[i];
+                    let v2 = vertices[(i + 1) % n];
                     draw_triangle(self.center, v1, v2, Color::new(0.1, 0.15, 0.2, 0.3));
                 }
             }
@@ -737,32 +706,30 @@ impl PolygonLayer {
         // Draw active edges.
         for i in 0..n {
             if self.active_edges[i] {
-                let v1 = transformed[i];
-                let v2 = transformed[(i + 1) % n];
+                let v1 = vertices[i];
+                let v2 = vertices[(i + 1) % n];
                 let thickness = (3.0 - self.layer_index as f32 * 0.5).max(1.0);
                 draw_line(v1.x, v1.y, v2.x, v2.y, thickness, self.color);
             }
         }
 
         // Draw vertex markers where at least one adjacent edge is active.
-        for i in 0..n {
+        for (i, &v) in vertices.iter().enumerate() {
             let prev_edge = if i == 0 { n - 1 } else { i - 1 };
             if self.active_edges[i] || self.active_edges[prev_edge] {
-                let v = transformed[i];
                 let size = (2.5 - self.layer_index as f32 * 0.3).max(1.0);
                 draw_circle(v.x, v.y, size, YELLOW);
             }
         }
     }
 
-    /// Draw ripples that intersect this layer.
     fn draw_ripple(&self, ripple: &Ripple) {
         let rings = (2.0 + ripple.intensity * 2.0) as i32;
         if rings <= 0 {
             return;
         }
 
-        let transformed = self.transformed_vertices();
+        let vertices = self.vertices();
 
         for i in 0..rings {
             let offset = i as f32 * (8.0 + 4.0 * (1.0 - ripple.intensity));
@@ -772,17 +739,19 @@ impl PolygonLayer {
             }
 
             let ring_opacity = ripple.opacity * (1.0 - i as f32 / rings as f32);
-            let segments = 60;
 
-            for seg in 0..segments {
-                let angle1 = (seg as f32) * 2.0 * PI / segments as f32;
-                let angle2 = ((seg + 1) as f32) * 2.0 * PI / segments as f32;
+            for seg in 0..RING_SEGMENTS {
+                let angle1 = (seg as f32) * TAU / RING_SEGMENTS as f32;
+                let angle2 = ((seg + 1) as f32) * TAU / RING_SEGMENTS as f32;
 
-                let p1 = ripple.origin + Vec2::new(angle1.cos() * radius, angle1.sin() * radius);
-                let p2 = ripple.origin + Vec2::new(angle2.cos() * radius, angle2.sin() * radius);
+                let (sin1, cos1) = angle1.sin_cos();
+                let (sin2, cos2) = angle2.sin_cos();
 
-                if point_inside_polygon(&transformed, &self.active_edges, p1)
-                    && point_inside_polygon(&transformed, &self.active_edges, p2)
+                let p1 = ripple.origin + Vec2::new(cos1 * radius, sin1 * radius);
+                let p2 = ripple.origin + Vec2::new(cos2 * radius, sin2 * radius);
+
+                if point_inside_polygon(vertices, &self.active_edges, p1)
+                    && point_inside_polygon(vertices, &self.active_edges, p2)
                 {
                     let thickness = ((1.5 + ripple.intensity) - i as f32 * 0.5).max(0.5);
                     let mut color = ripple.color;
@@ -793,24 +762,25 @@ impl PolygonLayer {
         }
     }
 
-    /// Draw a sound wave ring, clipped to this layer.
     fn draw_sound_wave(&self, wave: &SoundWave) {
         let opacity = wave.opacity();
         if opacity <= 0.01 {
             return;
         }
 
-        let transformed = self.transformed_vertices();
-        let segments = 60;
-        for seg in 0..segments {
-            let angle1 = (seg as f32) * 2.0 * PI / segments as f32;
-            let angle2 = ((seg + 1) as f32) * 2.0 * PI / segments as f32;
+        let vertices = self.vertices();
+        for seg in 0..RING_SEGMENTS {
+            let angle1 = (seg as f32) * TAU / RING_SEGMENTS as f32;
+            let angle2 = ((seg + 1) as f32) * TAU / RING_SEGMENTS as f32;
 
-            let p1 = wave.origin + Vec2::new(angle1.cos() * wave.radius, angle1.sin() * wave.radius);
-            let p2 = wave.origin + Vec2::new(angle2.cos() * wave.radius, angle2.sin() * wave.radius);
+            let (sin1, cos1) = angle1.sin_cos();
+            let (sin2, cos2) = angle2.sin_cos();
 
-            if point_inside_polygon(&transformed, &self.active_edges, p1)
-                && point_inside_polygon(&transformed, &self.active_edges, p2)
+            let p1 = wave.origin + Vec2::new(cos1 * wave.radius, sin1 * wave.radius);
+            let p2 = wave.origin + Vec2::new(cos2 * wave.radius, sin2 * wave.radius);
+
+            if point_inside_polygon(vertices, &self.active_edges, p1)
+                && point_inside_polygon(vertices, &self.active_edges, p2)
             {
                 draw_line(
                     p1.x,
@@ -824,15 +794,15 @@ impl PolygonLayer {
         }
     }
 
-    /// Check for collision between this polygon's edges and a ball.
+    /// Check for collision between this polygon's edges and a circle.
     ///
     /// Returns the closest collision point and normal if any.
-    fn check_collision(&self, ball: &Ball) -> Option<(Vec2, Vec2)> {
-        let transformed = self.transformed_vertices();
-        let n = transformed.len();
+    fn check_collision(&self, circle_center: Vec2, radius: f32) -> Option<(Vec2, Vec2)> {
+        let vertices = self.vertices();
+        let n = vertices.len();
 
-        // Optional early-out: if center isn't inside polygon, we skip.
-        if !point_inside_polygon(&transformed, &self.active_edges, ball.pos) {
+        // Early-out: if center isn't inside polygon, we skip.
+        if !point_inside_polygon(vertices, &self.active_edges, circle_center) {
             return None;
         }
 
@@ -843,11 +813,11 @@ impl PolygonLayer {
                 continue;
             }
 
-            let v1 = transformed[i];
-            let v2 = transformed[(i + 1) % n];
+            let v1 = vertices[i];
+            let v2 = vertices[(i + 1) % n];
 
             if let Some((point, normal, distance)) =
-                circle_line_collision(ball.pos, ball.radius, v1, v2)
+                circle_line_collision(circle_center, radius, v1, v2)
             {
                 match closest {
                     None => closest = Some((point, normal, distance)),
@@ -859,7 +829,7 @@ impl PolygonLayer {
             }
         }
 
-        closest.map(|(point, normal, _)| (point, normal))
+        closest.map(|(p, n, _)| (p, n))
     }
 }
 
@@ -867,20 +837,12 @@ impl PolygonLayer {
 // GEOMETRY & PHYSICS HELPERS
 // ============================================================================
 
-/// Rotate a point by an angle around the origin.
-fn rotate_point(point: Vec2, angle: f32) -> Vec2 {
-    Vec2::new(
-        point.x * angle.cos() - point.y * angle.sin(),
-        point.x * angle.sin() + point.y * angle.cos(),
-    )
+#[inline]
+fn rotate_point_sincos(point: Vec2, sin: f32, cos: f32) -> Vec2 {
+    Vec2::new(point.x * cos - point.y * sin, point.x * sin + point.y * cos)
 }
 
 /// Compute intersection between a circle and a line segment.
-///
-/// Returns:
-/// - the closest point on the segment,
-/// - the collision normal (pointing from segment toward the circle center),
-/// - and the distance from the circle center to that closest point.
 fn circle_line_collision(
     circle_center: Vec2,
     radius: f32,
@@ -901,39 +863,40 @@ fn circle_line_collision(
     let delta = circle_center - closest_point;
     let distance = delta.length();
 
-    if distance <= radius {
-        let normal = if distance > 0.001 {
-            delta / distance
-        } else {
-            // Degenerate case: circle almost exactly on the segment; use an
-            // arbitrary perpendicular direction.
-            Vec2::new(-line_vec.y, line_vec.x).normalize()
-        };
-        Some((closest_point, normal, distance))
-    } else {
-        None
+    if distance > radius {
+        return None;
     }
+
+    let normal = if distance > 0.001 {
+        delta / distance
+    } else {
+        Vec2::new(-line_vec.y, line_vec.x).normalize_or_zero()
+    };
+
+    Some((closest_point, normal, distance))
 }
 
 /// Reflect a velocity vector across a surface normal.
 ///
-/// The normal is assumed to be a unit vector pointing *out* of the surface.
-/// `restitution` scales how “bouncy” the reflection is.
-fn reflect_velocity(velocity: Vec2, normal: Vec2, restitution: f32) -> Vec2 {
-    let dot = velocity.dot(normal);
-    // If we're already moving away from the surface, don't reflect.
-    if dot > 0.0 {
-        return velocity;
+/// The normal is assumed to be a unit vector pointing from the surface toward the object.
+///
+/// With restitution `e`:
+/// - `e = 0` cancels the normal component (no bounce)
+/// - `e = 1` reflects fully (perfectly elastic)
+fn reflect_velocity(v: Vec2, n: Vec2, restitution: f32) -> Vec2 {
+    let e = restitution.clamp(0.0, 1.0);
+    let vn = v.dot(n);
+    if vn >= 0.0 {
+        return v;
     }
 
-    velocity - normal * (2.0 * dot * restitution.clamp(0.0, 1.0))
+    // v' = v - (1 + e) (v·n) n
+    v - (1.0 + e) * vn * n
 }
 
-/// Test if a point is inside a polygon defined by `vertices`, using a standard
-/// winding / ray casting algorithm.
+/// Ray-cast point-in-polygon test.
 ///
 /// `active_edges` controls which edges form the “solid” boundary.
-/// Inactive edges are ignored when computing inside-ness.
 fn point_inside_polygon(vertices: &[Vec2], active_edges: &[bool], point: Vec2) -> bool {
     let n = vertices.len();
     let mut inside = false;
@@ -946,10 +909,8 @@ fn point_inside_polygon(vertices: &[Vec2], active_edges: &[bool], point: Vec2) -
         let v1 = vertices[i];
         let v2 = vertices[(i + 1) % n];
 
-        // Ray-cast in Y; toggle `inside` whenever we cross an edge.
         let intersect = ((v1.y > point.y) != (v2.y > point.y))
-            && (point.x
-                < (v2.x - v1.x) * (point.y - v1.y) / (v2.y - v1.y + f32::EPSILON) + v1.x);
+            && (point.x < (v2.x - v1.x) * (point.y - v1.y) / (v2.y - v1.y + f32::EPSILON) + v1.x);
 
         if intersect {
             inside = !inside;
@@ -963,25 +924,21 @@ fn point_inside_polygon(vertices: &[Vec2], active_edges: &[bool], point: Vec2) -
 // SIMULATION ROOT
 // ============================================================================
 
-/// Top-level simulation state.
-///
-/// Owns:
-/// - Balls.
-/// - Arena polygon layers.
-/// - Visual effects (ripples, sound waves).
-/// - Statistics and debug display toggles.
 struct Simulation {
     balls: Vec<Ball>,
     layers: Vec<PolygonLayer>,
     ripples: Vec<Ripple>,
     sound_waves: Vec<SoundWave>,
+
+    // Scratch buffer reused each frame.
+    frame_collisions: Vec<CollisionInfo>,
+
     show_info: bool,
     total_collisions: usize,
     total_energy: f32,
 }
 
 impl Simulation {
-    /// Create a new simulation with randomized ball count and arena layout.
     fn new() -> Self {
         let center = Vec2::new(screen_width() / 2.0, screen_height() / 2.0);
         let balls = Self::spawn_balls(center);
@@ -990,8 +947,9 @@ impl Simulation {
         Self {
             balls,
             layers,
-            ripples: Vec::new(),
-            sound_waves: Vec::new(),
+            ripples: Vec::with_capacity(128),
+            sound_waves: Vec::with_capacity(64),
+            frame_collisions: Vec::with_capacity(64),
             show_info: true,
             total_collisions: 0,
             total_energy: 0.0,
@@ -1003,10 +961,12 @@ impl Simulation {
         let mut balls = Vec::with_capacity(ball_count);
 
         for i in 0..ball_count {
-            let angle = (i as f32) * 2.0 * PI / ball_count as f32;
+            let angle = (i as f32) * TAU / ball_count as f32;
+            let (sin, cos) = angle.sin_cos();
+
             let spawn_radius = 100.0 + rand::gen_range(-20.0, 20.0);
-            let x = center.x + angle.cos() * spawn_radius;
-            let y = center.y + angle.sin() * spawn_radius - 50.0;
+            let x = center.x + cos * spawn_radius;
+            let y = center.y + sin * spawn_radius - 50.0;
             balls.push(Ball::new(Vec2::new(x, y)));
         }
 
@@ -1025,34 +985,36 @@ impl Simulation {
         layers
     }
 
-    /// Per-frame update: handle input, physics, collisions, effects, and stats.
+    fn handle_input(&mut self) {
+        if is_key_pressed(KeyCode::Space) {
+            self.show_info = !self.show_info;
+        }
+
+        if is_key_pressed(KeyCode::R) {
+            *self = Simulation::new();
+        }
+    }
+
     fn update(&mut self, dt: f32) {
-        // 1. Layers rotate at their own angular velocity.
         for layer in &mut self.layers {
             layer.update(dt);
         }
 
-        // 2. Update all balls and collect wall collisions.
-        let mut collisions = Vec::new();
+        self.frame_collisions.clear();
+
         for ball in &mut self.balls {
-            collisions.extend(ball.update(dt, &self.layers));
+            ball.update(dt, &self.layers, &mut self.frame_collisions);
         }
 
-        // 3. Handle ball–ball collisions (second pass).
-        self.resolve_ball_collisions(&mut collisions);
-
-        // 4. Spawn visual effects from collision data.
-        self.spawn_effects_from_collisions(&collisions);
-
-        // 5. Advance ongoing effects and cull dead ones.
+        self.resolve_ball_collisions();
+        self.spawn_effects_from_collisions();
         self.update_effects(dt);
-
-        // 6. Recompute total kinetic + rotational energy for display.
         self.update_energy();
     }
 
-    fn resolve_ball_collisions(&mut self, collisions: &mut Vec<CollisionInfo>) {
+    fn resolve_ball_collisions(&mut self) {
         let len = self.balls.len();
+
         for i in 0..len {
             for j in (i + 1)..len {
                 let pos_i = self.balls[i].pos;
@@ -1061,40 +1023,42 @@ impl Simulation {
                 let distance = delta.length();
                 let min_distance = self.balls[i].radius + self.balls[j].radius;
 
-                if distance > 0.01 && distance < min_distance {
-                    let normal = delta / distance;
-                    let relative_velocity = self.balls[i].vel - self.balls[j].vel;
-                    let impact_speed = relative_velocity.dot(normal);
-
-                    if impact_speed < 0.0 {
-                        // Snapshot collision info *before* resolution for effects.
-                        let contact_point =
-                            self.balls[i].pos - normal * (self.balls[i].radius - (min_distance - distance) * 0.5);
-                        collisions.push(CollisionInfo {
-                            point: contact_point,
-                            impact_velocity: impact_speed.abs(),
-                            normal,
-                            material1: self.balls[i].material,
-                            material2: self.balls[j].material,
-                        });
-
-                        // Split mutable borrow to satisfy the borrow checker.
-                        let (left, right) = self.balls.split_at_mut(j);
-                        let ball1 = &mut left[i];
-                        let ball2 = &mut right[0];
-
-                        let combined_restitution =
-                            (ball1.material.restitution + ball2.material.restitution) * 0.5;
-
-                        ball1.resolve_ball_collision(ball2, normal, combined_restitution);
-                    }
+                if distance <= 0.01 || distance >= min_distance {
+                    continue;
                 }
+
+                let normal = delta / distance;
+                let relative_velocity = self.balls[i].vel - self.balls[j].vel;
+                let impact_speed = relative_velocity.dot(normal);
+
+                if impact_speed >= 0.0 {
+                    continue;
+                }
+
+                // Record collision for effects.
+                let contact_point = self.balls[i].pos - normal * self.balls[i].radius;
+                self.frame_collisions.push(CollisionInfo {
+                    point: contact_point,
+                    impact_velocity: impact_speed.abs(),
+                    normal,
+                    material1: self.balls[i].material,
+                    material2: self.balls[j].material,
+                });
+
+                // Split mutable borrow to satisfy the borrow checker.
+                let (left, right) = self.balls.split_at_mut(j);
+                let ball1 = &mut left[i];
+                let ball2 = &mut right[0];
+
+                let combined_restitution =
+                    (ball1.material.restitution + ball2.material.restitution) * 0.5;
+                ball1.resolve_ball_collision(ball2, normal, combined_restitution);
             }
         }
     }
 
-    fn spawn_effects_from_collisions(&mut self, collisions: &[CollisionInfo]) {
-        for collision in collisions {
+    fn spawn_effects_from_collisions(&mut self) {
+        for collision in &self.frame_collisions {
             self.ripples.push(Ripple::new(
                 collision.point,
                 collision.impact_velocity,
@@ -1131,20 +1095,18 @@ impl Simulation {
             .balls
             .iter()
             .map(|b| {
-                // Translation kinetic energy: 1/2 m v^2
                 let translational = 0.5 * b.mass * b.vel.length_squared();
-                // Rotational energy: approximate as 1/2 I ω^2 with I ≈ m r^2.
-                let rotational = 0.5 * b.mass * b.radius * b.radius * b.angular_velocity * b.angular_velocity;
+                let rotational =
+                    0.5 * b.mass * b.radius * b.radius * b.angular_velocity * b.angular_velocity;
                 translational + rotational
             })
             .sum();
     }
 
-    /// Draw the entire frame: background, effects, layers, balls, and HUD.
     fn draw(&self) {
         clear_background(Color::new(0.05, 0.05, 0.08, 1.0));
 
-        // Draw ripple and sound wave effects clipped against outer layer.
+        // Effects are clipped against the outermost layer.
         if let Some(outer_layer) = self.layers.first() {
             for ripple in &self.ripples {
                 outer_layer.draw_ripple(ripple);
@@ -1154,12 +1116,11 @@ impl Simulation {
             }
         }
 
-        // Draw layers from inner to outer.
+        // Draw layers from outer to inner so the outer fill doesn't cover inner geometry.
         for layer in &self.layers {
             layer.draw();
         }
 
-        // Draw all balls on top.
         for ball in &self.balls {
             ball.draw();
         }
@@ -1169,42 +1130,29 @@ impl Simulation {
         }
     }
 
-    /// Draw HUD: performance stats, material legend, and controls.
     fn draw_info_overlay(&self) {
         let info_color = GREEN;
 
-        // --- Stats ---------------------------------------------------------
-        draw_text(
-            &format!("FPS: {}", get_fps()),
-            10.0,
-            20.0,
-            20.0,
-            info_color,
-        );
+        draw_text(&format!("FPS: {}", get_fps()), 10.0, 20.0, 20.0, info_color);
 
-        let rubber_count = self
-            .balls
-            .iter()
-            .filter(|b| b.material.kind == MaterialKind::Rubber)
-            .count();
-        let glass_count = self
-            .balls
-            .iter()
-            .filter(|b| b.material.kind == MaterialKind::Glass)
-            .count();
-        let steel_count = self
-            .balls
-            .iter()
-            .filter(|b| b.material.kind == MaterialKind::Steel)
-            .count();
+        let mut rubber = 0;
+        let mut glass = 0;
+        let mut steel = 0;
+        for b in &self.balls {
+            match b.material.kind {
+                MaterialKind::Rubber => rubber += 1,
+                MaterialKind::Glass => glass += 1,
+                MaterialKind::Steel => steel += 1,
+            }
+        }
 
         draw_text(
             &format!(
                 "Balls: {} (Rubber={} Glass={} Steel={})",
                 self.balls.len(),
-                rubber_count,
-                glass_count,
-                steel_count
+                rubber,
+                glass,
+                steel
             ),
             10.0,
             40.0,
@@ -1249,13 +1197,7 @@ impl Simulation {
         );
 
         draw_circle(20.0, 170.0, 5.0, Color::new(0.7, 0.7, 0.8, 1.0));
-        draw_text(
-            "Steel: Heavy, Less Bouncy, Smooth",
-            35.0,
-            175.0,
-            14.0,
-            GRAY,
-        );
+        draw_text("Steel: Heavy, Less Bouncy, Smooth", 35.0, 175.0, 14.0, GRAY);
 
         draw_circle(20.0, 190.0, 5.0, Color::new(0.6, 0.8, 0.9, 1.0));
         draw_text(
@@ -1266,7 +1208,6 @@ impl Simulation {
             GRAY,
         );
 
-        // --- Controls ------------------------------------------------------
         draw_text(
             "Controls: SPACE = Toggle Info | R = New Simulation",
             10.0,
@@ -1274,17 +1215,6 @@ impl Simulation {
             20.0,
             GRAY,
         );
-    }
-
-    /// Handle per-frame input such as toggling HUD or resetting the simulation.
-    fn handle_input(&mut self) {
-        if is_key_pressed(KeyCode::Space) {
-            self.show_info = !self.show_info;
-        }
-
-        if is_key_pressed(KeyCode::R) {
-            *self = Simulation::new();
-        }
     }
 }
 
@@ -1294,18 +1224,26 @@ impl Simulation {
 
 #[macroquad::main("Advanced Physics Simulation (Idiomatic Rust 2024)")]
 async fn main() {
-    // Seed macroquad's RNG once, using current timestamp.
     rand::srand(macroquad::miniquad::date::now() as u64);
 
     let mut sim = Simulation::new();
 
+    let mut accumulator = 0.0_f32;
+
     loop {
-        let dt = get_frame_time().min(MAX_FRAME_TIME);
+        let frame_dt = get_frame_time().min(MAX_FRAME_TIME);
+        accumulator = (accumulator + frame_dt).min(MAX_ACCUMULATED_TIME);
 
         sim.handle_input();
-        sim.update(dt);
-        sim.draw();
 
+        let mut steps = 0;
+        while accumulator >= FIXED_DT && steps < MAX_STEPS_PER_FRAME {
+            sim.update(FIXED_DT);
+            accumulator -= FIXED_DT;
+            steps += 1;
+        }
+
+        sim.draw();
         next_frame().await;
     }
 }
